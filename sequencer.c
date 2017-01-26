@@ -37,8 +37,12 @@
 #pragma config CPD = ON         // Data NVM Memory Code Protection bit (Data NVM code protection enabled)
 
 #define _XTAL_FREQ 1000000
-#define ADC_VALUE_STARTUP 700
-#define ADC_VALUE_SHUTDOWN 600
+#define ADC_VALUE_STARTUP 890
+#define STARTUP_COUNT 8
+
+#define MINIMUM_DELAY 70
+#define AVERAGE_COUNT 32
+#define AVERAGE_SHIFT 7
 
 #define PPTLED_TRIS TRISAbits.TRISA4
 #define PPTLED_MASK 0b00010000
@@ -78,8 +82,12 @@
 typedef enum Status 
 {
     STATUS_STARTUP,
-    STATUS_RUNNING,
-    STATUS_UNDERVOLTAGE
+    STATUS_RX_MODE,
+    STATUS_PREAMP_OFF,
+    STATUS_RELAY_ON,
+    STATUS_TX_MODE,
+    STATUS_AMPLIFIER_OFF,
+    STATUS_RELAY_OFF          
 } status_t;
 
 typedef enum adc_channel
@@ -93,6 +101,12 @@ uint8_t portB;
 uint8_t portC;
 status_t status;
 uint16_t adc_value;
+uint8_t adc_count;
+
+uint16_t interrupt_count;
+uint16_t startup_count;
+uint16_t adc_sum;
+uint16_t delay;
 
 
 static void init(void);
@@ -102,8 +116,11 @@ static void adc_set_channel(adc_channel_t channel);
 static inline void adc_start_conversion(void);
 static uint16_t adc_get_result(void);
 
+static void timer_init(void);
+static void ioc_init(void);
+
 static void startup(void);
-static void undervoltage(void);
+static void run(void);
 
 static inline void pwrled_on(void);
 static inline void pwrled_off(void);
@@ -116,6 +133,72 @@ static inline void relay2_on(void);
 static inline void relay2_off(void);
 static inline void relay3_on(void);
 static inline void relay3_off(void);
+
+void interrupt ISR(void)
+{ 
+    //Timer Interrupt
+    if(PIR1bits.TMR2IF)
+    {
+        if(status==STATUS_STARTUP)
+        {
+            startup();
+        }
+        else
+        {
+            run();
+        }
+        //Clear interrupt flag
+        PIR1bits.TMR2IF = 0;
+    }
+    
+    //Interrupt on Change
+    if(IOCCFbits.IOCCF1)
+    {
+        interrupt_count = 0;
+        if(PPTSENSE_PIN)
+        {
+            pptled_off();
+            switch(status)
+            {
+                case STATUS_PREAMP_OFF:
+                    relay1_on();
+                    status = STATUS_RX_MODE;
+                    break;
+                case STATUS_RELAY_ON:
+                    relay2_off();
+                    status = STATUS_RELAY_OFF;
+                    break;
+                case STATUS_TX_MODE:
+                    relay3_off();
+                    status = STATUS_AMPLIFIER_OFF;
+                    break;
+            }
+        }
+        else
+        {
+            pptled_on();
+            switch(status)
+            {
+                case STATUS_AMPLIFIER_OFF:
+                    relay3_on();
+                    status = STATUS_TX_MODE;
+                    break;
+                case STATUS_RELAY_OFF:
+                    relay2_on();
+                    status = STATUS_RELAY_ON;
+                    break;
+                case STATUS_RX_MODE:
+                    relay1_off();
+                    status = STATUS_PREAMP_OFF;
+                    break;
+            }
+        }
+        //Clear interrupt flag
+        IOCCFbits.IOCCF1 = 0;
+    }
+    
+    
+}
 
 static inline void pwrled_on(void)
 {
@@ -189,7 +272,14 @@ static void init(void)
     portB = 0x00;
     portC = 0x00;
     status = STATUS_STARTUP;
+    
+    
+    interrupt_count = 0;
+    startup_count = 0;
     adc_value = 0;
+    adc_sum = 0;
+    adc_count = 0;
+    delay = 200;
     
     //Digital outputs
     PPTLED_TRIS = 0;
@@ -227,6 +317,8 @@ static void init(void)
     adc_init();
     adc_set_channel(ADC_CHANNEL_INPUTVOLTAGE);
     adc_start_conversion();
+    
+    timer_init();
 }
 
 static void adc_init(void)
@@ -239,8 +331,8 @@ static void adc_init(void)
     ADCON0bits.ADON = 1;
     //Conversion Clock = fosc/2
     ADCON1bits.ADCS = 0b000;
-    //Negative reference = AVSS RA2 (pin 11)
-    ADCON1bits.ADNREF = 1;
+    //Negative reference = Ground
+    ADCON1bits.ADNREF = 0;
     //Output format right-justified
     ADCON1bits.ADFM = 1;
 }
@@ -285,81 +377,146 @@ static uint16_t adc_get_result(void)
     return adc_value;
 }
 
+static void timer_init(void)
+{
+    //Prescaler = 16
+    T2CONbits.T2CKPS = 0b10;
+    //Postscaler = 1
+    T2CONbits.T2OUTPS = 0b0000;
+    // 1 = 1MHz / 4 / 16  = 64us
+    //Period = 122 -> 1.024ms
+    PR2 = 16;
+    //Zero timer 2
+    TMR2 = 0x00;
+    //Clear Interrupt flag
+    PIR1bits.TMR2IF = 0;
+    //Enable general interrupts
+    INTCONbits.GIE = 1;
+    //Enable peripheral interrupts
+    INTCONbits.PEIE = 1;
+    //Enable timer2 interrupts
+    PIE1bits.TMR2IE = 1;
+    //Turn timer 2 on
+    T2CONbits.TMR2ON = 1;    
+}
+
+static void ioc_init(void)
+{
+    IOCCNbits.IOCCN1 = 1;
+    IOCCPbits.IOCCP1 = 1;
+    IOCCFbits.IOCCF1 = 0;
+    
+    //Enable general interrupts
+    //INTCONbits.GIE = 1;
+    //Enable peripheral interrupts
+    //INTCONbits.PEIE = 1;
+    //Enable interrupt-on-change
+    PIE0bits.IOCIE = 1;
+}
+
 
 void main(void) 
 {
     uint8_t cntr;
-    
+  
     init();
-    startup();
     
     while(1)
     {
-        
-        __delay_ms(1);
-        
-        adc_value = adc_get_result();
-        adc_start_conversion();
-        if(adc_value<ADC_VALUE_SHUTDOWN)
-        {
-            undervoltage();
-        }
-        if(PPTSENSE_PIN)
-        {
-            pptled_off();
-        }
-        else
-        {
-            pptled_on();
-        }
+        __delay_ms(50);
         CLRWDT(); 
-    }  
-    
+    }
+
     return;
 }
 
 static void startup(void)
 {
-    uint8_t cntr = 0;
-    while(cntr<20)
+    ++interrupt_count;
+    adc_value = adc_get_result();
+    if(adc_value<ADC_VALUE_STARTUP)
     {
-        adc_value = adc_get_result();
-        adc_start_conversion();
-        if(adc_value<ADC_VALUE_STARTUP)
+        startup_count = 0;
+    }
+    if(interrupt_count==100)
+    {
+        pwrled_on();
+        pptled_off();
+    }
+    if(interrupt_count==200)
+    {
+        ++startup_count;
+        interrupt_count = 0;
+        if(startup_count==STARTUP_COUNT)
         {
-            cntr = 0;
-            pwrled_toggle();
-        }
+            adc_set_channel(ADC_CHANNEL_SPEED);
+            startup_count = 0;
+            if(PPTSENSE_PIN)
+            {
+                pptled_off();
+                relay1_on();
+                status = STATUS_RX_MODE;
+                
+            }
+            else
+            {
+                pptled_on();
+                relay2_on();
+                status = STATUS_RELAY_ON;
+            }
+            ioc_init();
+        }  
         else
         {
-            ++cntr;
-            pwrled_on();
-        }
-        
-        __delay_ms(100);
-        CLRWDT(); 
+            pwrled_off();
+            if(adc_value<ADC_VALUE_STARTUP)
+            {
+                pptled_on();
+            }
+        }    
     }
+    adc_start_conversion(); 
 }
 
-static void undervoltage(void)
+static void run(void)
 {
-    uint8_t cntr = 0;
-    while(cntr<20)
+    //Measure pot and calculate delay
+    adc_sum += adc_get_result();
+    adc_start_conversion();
+    ++adc_count;
+    if(adc_count==AVERAGE_COUNT)
     {
-        pptled_off();
-        pwrled_toggle();
-        adc_value = adc_get_result();
-        adc_start_conversion();
-        if(adc_value<ADC_VALUE_STARTUP)
+       delay = adc_sum >> AVERAGE_SHIFT;
+       delay += MINIMUM_DELAY;
+       adc_sum = 0;
+       adc_count = 0;
+    }
+    
+    ++interrupt_count;
+    
+    if(interrupt_count==delay)
+    {
+        switch(status)
         {
-            cntr = 0;
+            case STATUS_AMPLIFIER_OFF:
+                relay2_off();
+                status = STATUS_RELAY_OFF;
+                break;
+            case STATUS_RELAY_OFF:
+                relay1_on();
+                status = STATUS_RX_MODE;
+                break;
+            case STATUS_PREAMP_OFF:
+                relay2_on();
+                status = STATUS_RELAY_ON;
+                break;
+            case STATUS_RELAY_ON:
+                relay3_on();
+                status = STATUS_TX_MODE;
+                break;
         }
-        else
-        {
-            ++cntr;
-        }
-        __delay_ms(100);
-        CLRWDT(); 
-    }    
-    pwrled_on();
+        interrupt_count = 0;
+    }
+    
+
 }
