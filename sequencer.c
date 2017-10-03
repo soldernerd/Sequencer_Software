@@ -97,7 +97,6 @@ typedef enum adc_channel
 } adc_channel_t;
 
 uint8_t portA;
-uint8_t portB;
 uint8_t portC;
 status_t status;
 uint16_t adc_value;
@@ -151,8 +150,8 @@ void interrupt ISR(void)
         PIR1bits.TMR2IF = 0;
     }
     
-    //Interrupt on Change
-    if(IOCCFbits.IOCCF1)
+    //Interrupt on Change (only care if interrupt on change is enabled)
+    if(IOCCFbits.IOCCF1 && IOCCNbits.IOCCN1 && IOCCPbits.IOCCP1)
     {
         interrupt_count = 0;
         if(PPTSENSE_PIN)
@@ -268,18 +267,11 @@ static inline void relay3_off(void)
 
 static void init(void)
 {
+    //Initialize outputs
     portA = 0x00;
-    portB = 0x00;
+    PORTA = portA;
     portC = 0x00;
-    status = STATUS_STARTUP;
-    
-    
-    interrupt_count = 0;
-    startup_count = 0;
-    adc_value = 0;
-    adc_sum = 0;
-    adc_count = 0;
-    delay = 200;
+    PORTC = portC;
     
     //Digital outputs
     PPTLED_TRIS = 0;
@@ -288,6 +280,18 @@ static void init(void)
     RELAY2_TRIS = 0;
     RELAY3_TRIS = 0;
     
+    //Initialize outputs (just to make sure, outputs are not double-buffered on PIC16)
+    PORTA = portA;
+    PORTC = portC;
+    
+    status = STATUS_STARTUP;
+    interrupt_count = 0;
+    startup_count = 0;
+    adc_value = 0;
+    adc_sum = 0;
+    adc_count = 0;
+    delay = 200;
+
     //Digital inputs
     PPTSENSE_TRIS = 1;
     PPTSENSE_ANSEL = 0;
@@ -296,7 +300,7 @@ static void init(void)
     VINSENSE_TRIS = 1;
     VINSENSE_ANSEL = 1;
     
-    //vin
+    //Input voltage sensing
     TRISCbits.TRISC0 = 1;
     ANSELCbits.ANSC0 = 1;
     
@@ -417,8 +421,6 @@ static void ioc_init(void)
 
 void main(void) 
 {
-    uint8_t cntr;
-  
     init();
     
     while(1)
